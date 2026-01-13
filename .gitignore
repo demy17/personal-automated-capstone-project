@@ -1,6 +1,39 @@
+# Terraform
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+terraform.tfvars
+*.tfvars
+
 # SSH keys
 *.pem
 *-key
 *-key.pub
+*.pem
+*-key
+# Terraform
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+terraform.tfvars
+*.tfvars
+
+# Terraform
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+terraform.tfvars
+*.tfvars
+
+# SSH keys
+*.pem
+*-key
+*-key.pub
+# Terraform
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+terraform.tfvars
+*.tfvars
 
 
