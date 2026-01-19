@@ -473,29 +473,195 @@ resource "aws_launch_template" "launch_template" {
   }
 }
 
-# auto scaling policy
-resource "aws_autoscaling_policy" "scale_out" {
-  name                   = "scale-out-policy"
-  scaling_adjustment     = 1
-  adjustment_type        = "ChangeInCapacity"
-  cooldown               = 300
-  autoscaling_group_name = aws_autoscaling_group.my_asg.name
-}
 # Create the Auto Scaling Group
 resource "aws_autoscaling_group" "my_asg" {
-  name                 = "my-web-asg"
-  vpc_zone_identifier  = [aws_subnet.pub-sub1.id, aws_subnet.pub-sub2.id]
-  desired_capacity     = 2
-  min_size             = 1
-  max_size             = 4
+  name                = "${local.name}-web-asg"
+  vpc_zone_identifier = [aws_subnet.pri_sub1.id,aws_subnet.pri_sub2.id]
+  desired_capacity = 2
+  min_size         = 1
+  max_size         = 4
+
+  health_check_type         = "ELB"
   health_check_grace_period = 300
-  health_check_type    = "EC2"
-  force_delete         = true
+  force_delete              = true
 
   launch_template {
     id      = aws_launch_template.launch_template.id
     version = "$Latest"
   }
-  
   target_group_arns = [aws_lb_target_group.my_target_group.arn]
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name}-wordpress"
+    propagate_at_launch = true
+  }
+}
+
+# auto scaling policy
+resource "aws_autoscaling_policy" "scale_out" {
+  name                   = "${local.name}-scale-out"
+  scaling_adjustment     = 1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 300
+  autoscaling_group_name = aws_autoscaling_group.my_asg.name
+}
+
+# Phase 7 (Traffic management)
+# HTTP Target Group
+resource "aws_lb_target_group" "wordpress_tg" {
+  name        = "${local.name}-tg"
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.vpc.id
+  target_type = "instance"
+
+  health_check {
+    path                = "/indextest.html"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
+    matcher             = "200"
+  }
+
+  tags = {
+    Name = "${local.name}-tg"
+  }
+}
+#creating acm certificate for ssl
+resource "aws_acm_certificate" "acm_cert" {
+  domain_name               = "aleyi.space"
+  validation_method         = "DNS"
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+# Route53 Validation Records
+resource "aws_route53_record" "cert_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.acm_cert.domain_validation_options :
+    dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  zone_id = data.aws_route53_zone.set_26_hz.zone_id
+  name    = each.value.name
+  type    = each.value.type
+  records = [each.value.record]
+  ttl     = 60
+}
+# Certificate Validation
+resource "aws_acm_certificate_validation" "cert_validation" {
+  certificate_arn         = aws_acm_certificate.acm_cert.arn
+  validation_record_fqdns = [
+    for record in aws_route53_record.cert_validation : record.fqdn
+  ]
+}
+# HTTP Listener → HTTPS Redirect
+resource "aws_lb_listener" "http_listener" {
+  load_balancer_arn = aws_lb.my_alb.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+# HTTPS Listener → Target Group
+resource "aws_lb_listener" "https_listener" {
+  load_balancer_arn = aws_lb.my_alb.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = aws_acm_certificate_validation.cert_validation.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.wordpress_tg.arn
+  }
+}
+# Phase 8 (CDN & Performance)
+#  CloudFront Origin Access Control (OAC)
+resource "aws_cloudfront_origin_access_control" "set_26_media_oac" {
+  name                              = "${local.name}-media-oac"
+  description                       = "OAC for ${local.name}-media-bucket"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+#  CloudFront Distribution
+resource "aws_cloudfront_distribution" "set_26_media_distribution" {
+  enabled = true
+
+  origin {
+    domain_name              = aws_s3_bucket.media_bucket.bucket_regional_domain_name
+    origin_id                = local.s3_origin_id
+    origin_access_control_id = aws_cloudfront_origin_access_control.set_26_media_oac.id
+  }
+
+  default_cache_behavior {
+    target_origin_id       = local.s3_origin_id
+    viewer_protocol_policy = "redirect-to-https"
+
+    allowed_methods = ["GET", "HEAD"]
+    cached_methods  = ["GET", "HEAD"]
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+    min_ttl     = 3600
+    default_ttl = 86400
+    max_ttl     = 31536000
+  }
+  price_class = "PriceClass_100"
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+  viewer_certificate {
+  acm_certificate_arn      = aws_acm_certificate.us_east_cert.arn
+  ssl_support_method       = "sni-only"
+  minimum_protocol_version = "TLSv1.2_2021"
+}
+  tags = {
+    Name = "${local.name}-media-distribution"
+  }
+}
+# S3 Media Bucket Policy
+data "aws_iam_policy_document" "media_bucket_policy" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudfront.amazonaws.com"]
+    }
+
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.media_bucket.arn}/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceArn"
+      values   = [aws_cloudfront_distribution.set_26_media_distribution.arn]
+    }
+  }
+}
+resource "aws_s3_bucket_policy" "media_bucket_policy" {
+  bucket = aws_s3_bucket.media_bucket.id
+  policy = data.aws_iam_policy_document.media_bucket_policy.json
 }
